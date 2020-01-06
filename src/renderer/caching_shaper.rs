@@ -6,7 +6,7 @@ use skulpin::skia_safe::{TextBlob, Font, Point, TextBlobBuilder};
 use font_kit::source::SystemSource;
 use skribo::{
     layout, layout_run, make_layout, FontCollection, FontFamily, FontRef, Layout, LayoutSession,
-    TextStyle
+    TextStyle, Glyph
 };
 
 use super::fonts::FontLookup;
@@ -29,8 +29,8 @@ struct ShapeKey {
 }
 
 pub struct CachingShaper {
-    font_cache: LruCache<FontKey, FontRef>,
-    blob_cache: LruCache<ShapeKey, TextBlob>
+    font_cache: LruCache<FontKey, FontCollection>,
+    blob_cache: LruCache<ShapeKey, Vec<(String, TextBlob)>>
 }
 
 impl CachingShaper {
@@ -43,7 +43,17 @@ impl CachingShaper {
 
     fn get_font(&mut self, font_key: &FontKey) -> &FontRef {
         if !self.font_cache.contains(font_key) {
+            let mut collection = FontCollection::new();
             let source = SystemSource::new();
+
+            let emoji_font = source
+                .select_family_by_name("Segoe UI Emoji")
+                .expect("Failed to load emoji font by postscript name")
+                .fonts()[0]
+                .load()
+                .unwrap();
+            collection.add_family(FontFamily::new_from_font(emoji_font));
+
             let font_name = font_key.name.clone();
             let font = source
                 .select_family_by_name(&font_name)
@@ -51,35 +61,58 @@ impl CachingShaper {
                 .fonts()[0]
                 .load()
                 .unwrap();
-            self.font_cache.put(font_key.clone(), FontRef::new(font));
+            collection.add_family(FontFamily::new_from_font(font));
+
+            self.font_cache.put(font_key.clone(), collection);
         }
 
         self.font_cache.get(font_key).unwrap()
     }
 
-    pub fn shape(&mut self, text: &str, font_name: &str, base_size: f32, scale: u16, bold: bool, italic: bool, font: &Font) -> TextBlob {
-        let font_key = FontKey::new(font_name.to_string(), base_size.to_string(), scale, bold, italic);
-        let font_ref = self.get_font(&font_key);
-
-        let style = TextStyle { size: base_size * scale as f32 };
-        let layout = layout_run(&style, &font_ref, text);
-
+    fn make_blob(glyphs: Vec<Glyph>, base_size: f32) -> TextBlob {
         let mut blob_builder = TextBlobBuilder::new();
-
         
-        let count = layout.glyphs.len();
-        let metrics = font_ref.font.metrics();
+        let count = glyphs.len();
+        let metrics = glyphs[0].font.font.metrics();
         let ascent = metrics.ascent * base_size / metrics.units_per_em as f32;
         let (glyphs, positions) = blob_builder.alloc_run_pos_h(font, count, ascent, None);
 
-        for (i, glyph_id) in layout.glyphs.iter().map(|glyph| glyph.glyph_id as u16).enumerate() {
+        for (i, glyph_id) in glyphs.iter().map(|glyph| glyph.glyph_id as u16).enumerate() {
             glyphs[i] = glyph_id;
         }
-        for (i, offset) in layout.glyphs.iter().map(|glyph| glyph.offset.x as f32).enumerate() {
+        for (i, offset) in glyphs.iter().map(|glyph| glyph.offset.x as f32).enumerate() {
             positions[i] = offset;
         }
 
         blob_builder.make().unwrap()
+    }
+
+    pub fn shape(&mut self, text: &str, font_name: &str, base_size: f32, scale: u16, bold: bool, italic: bool, font: &Font) -> Vec<(String, TextBlob)> {
+        let font_key = FontKey::new(font_name.to_string(), base_size.to_string(), scale, bold, italic);
+        let font_collection = self.get_font(&font_key);
+
+        let style = TextStyle { size: base_size * scale as f32 };
+        let layout = layout(&style, &font_collection, text);
+
+        let blobs = Vec::new();
+
+        let mut current_run = Vec::new();
+        let mut current_font = None;
+        for glyph in layout.glyphs.into_iter() {
+            if !current_font.is_none() && glyph.font.font.full_name() != current_font.unwrap() {
+                blobs.push((current_font.unwrap(), make_blob(current_run, base_size)));
+                current_run = Vec::new();
+            }
+
+            current_font = Some(glyph.font.font.full_name());
+            current_run.push(glyph);
+        }
+
+        if current_run.len() > 0 {
+            blobs.push((current_font.unwrap(), make_blob(current_run, base_size)));
+        }
+
+        blobs
     }
 
     pub fn shape_cached(&mut self, text: &str, font_name: &str, base_size: f32, scale: u16, bold: bool, italic: bool, font: &Font) -> &TextBlob {
